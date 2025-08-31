@@ -21,7 +21,7 @@ class MainActivity : ComponentActivity() {
             HelloAIAdventTemplateTheme {
                 Scaffold(modifier = Modifier.fillMaxSize()) { innerPadding ->
                     Greeting(
-                        name = "AI Advent 2025",
+                        name = "AI Advent 2025 Day 22",
                         modifier = Modifier.padding(innerPadding)
                     )
                 }
