@@ -1,0 +1,166 @@
+name: PR AI Summary
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+jobs:
+  summarize:
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
+
+    steps:
+      - name: Checkout base branch (safe for forks)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha }}
+          fetch-depth: 0
+
+      - name: Build prompt (diff base..head without checking out PR code)
+        id: build
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_HEAD_CLONE_URL: ${{ github.event.pull_request.head.repo.clone_url }}
+        run: |
+          set -euo pipefail
+          echo "### PR Title" > PR_CONTEXT.md
+          echo "${PR_TITLE:-}" >> PR_CONTEXT.md
+          echo -e "\n### PR Body\n${PR_BODY:-}" >> PR_CONTEXT.md
+
+          git remote add pr "${PR_HEAD_CLONE_URL}"
+          if git fetch pr "$HEAD_SHA" --depth=50; then
+            echo -e "\n### Diffstat" >> PR_CONTEXT.md
+            git diff --shortstat "$BASE_SHA" "$HEAD_SHA" >> PR_CONTEXT.md || true
+            echo -e "\n### Commits" >> PR_CONTEXT.md
+            git log --oneline "$BASE_SHA".."$HEAD_SHA" --no-merges -n 100 >> PR_CONTEXT.md || true
+          else
+            echo -e "\n_(diff unavailable: cannot fetch head commit)_" >> PR_CONTEXT.md
+          fi
+
+          head -n 400 PR_CONTEXT.md > PR_CTX_TRIMMED.md
+
+      - name: Call LLM (with retries & fallback; always writes AI_SUMMARY.md)
+        id: llm
+        env:
+          OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+          LLM_FALLBACKS: ${{ vars.LLM_FALLBACKS }}
+        run: |
+          set -euo pipefail
+          OUT="_AI summary unavailable_"
+
+          DEF_PRIMARY="deepseek/deepseek-chat-v3-0324:free"
+          DEF_FALLBACKS="deepseek/deepseek-r1:free"
+          PRIMARY="${LLM_MODEL:-$DEF_PRIMARY}"
+          FALLBACKS="${LLM_FALLBACKS:-$DEF_FALLBACKS}"
+
+          sanitize_token_inline() {
+            cleaned="$(cat | tr -d '\r\n' \
+              | sed -E 's/^[[:space:]"]+//; s/[[:space:]"]+$//' \
+              | perl -CSDA -pe 's/\x{200B}|\x{200C}|\x{200D}|\x{FEFF}//g; s/\p{Space}//g')"
+            printf '%s' "$cleaned"
+          }
+          API_KEY="$(printf '%s' "${OPEN_ROUTER_API_KEY-}" | sanitize_token_inline)"
+
+          echo "Has OPEN_ROUTER_API_KEY (secret): $([ -n "${OPEN_ROUTER_API_KEY:-}" ] && echo '✅' || echo '⛔')" >> "$GITHUB_STEP_SUMMARY"
+          echo "API key length after sanitize: $(printf '%s' "$API_KEY" | wc -c)" >> "$GITHUB_STEP_SUMMARY"
+          echo "Primary model: ${PRIMARY}" >> "$GITHUB_STEP_SUMMARY"
+          echo "Fallbacks: ${FALLBACKS}" >> "$GITHUB_STEP_SUMMARY"
+
+          if [ -z "$API_KEY" ]; then
+            printf "%s" "$OUT" > AI_SUMMARY.md
+            exit 0
+          fi
+
+          SYS='Ты — помощник ревьюера. Сформируй Markdown-ответ:
+          1) Summary — 2–4 пункта.
+          2) Risk & Impact — что может сломаться.
+          3) Test checklist — чекбоксы.
+          4) Suggested labels — через запятую (feature, bugfix, docs, chore, perf, refactor, test).
+          Кратко и по делу, без преамбул.'
+
+          USR=$(printf "Контекст PR:\n%s" "$(cat PR_CTX_TRIMMED.md)")
+
+          call_model() {
+            local M="$1"
+            local JSON=$(jq -n --arg s "$SYS" --arg u "$USR" --arg m "$M" \
+              '{model:$m, messages:[{"role":"system","content":$s},{"role":"user","content":$u}], temperature:0.2}')
+            curl -sS https://openrouter.ai/api/v1/chat/completions \
+              -H "Authorization: Bearer ${API_KEY}" \
+              -H "Content-Type: application/json" \
+              -H "HTTP-Referer: https://github.com/${{ github.repository }}" \
+              -H "X-Title: PR AI Summary" \
+              -d "$JSON"
+          }
+
+          try_models() {
+            local MODELS_CSV="$1"
+            IFS=',' read -r -a MODELS <<< "$MODELS_CSV"
+            for M in "${MODELS[@]}"; do
+              M="$(echo "$M" | xargs)"; [ -n "$M" ] || continue
+              echo "→ Trying model: $M" >> "$GITHUB_STEP_SUMMARY"
+              for attempt in 1 2 3; do
+                RESP="$(call_model "$M")" || true
+                ERR_CODE="$(echo "$RESP" | jq -r '.error.code // empty' 2>/dev/null || true)"
+                if [ -n "$ERR_CODE" ]; then
+                  echo "  attempt #$attempt error:" >> "$GITHUB_STEP_SUMMARY"
+                  echo "$RESP" | jq .error >> "$GITHUB_STEP_SUMMARY"
+                  if [ "$ERR_CODE" = "429" ]; then sleep $(( 2 ** (attempt + 1) )); continue; else break; fi
+                fi
+                OUT="$(echo "$RESP" | jq -r '.choices[0].message.content // empty')"
+                if [ -n "$OUT" ]; then
+                  echo "✓ Succeeded with: $M (attempt $attempt)" >> "$GITHUB_STEP_SUMMARY"
+                  printf "%s" "$OUT" > AI_SUMMARY.md
+                  return 0
+                else
+                  sleep $(( 2 ** (attempt + 1) ))
+                fi
+              done
+            done
+            return 1
+          }
+
+          if try_models "$PRIMARY"; then :; elif try_models "$FALLBACKS"; then :; else
+            echo "All models failed (see errors above)." >> "$GITHUB_STEP_SUMMARY"
+            printf "%s" "$OUT" > AI_SUMMARY.md
+          fi
+
+      - name: Comment summary
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const body = fs.readFileSync('AI_SUMMARY.md', 'utf8');
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body
+            });
+
+      - name: Apply labels (best-effort)
+        if: always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let text = '';
+            try { text = fs.readFileSync('AI_SUMMARY.md','utf8'); } catch(e) {}
+            const m = text.match(/Suggested labels:\s*(.+)/i);
+            if (m) {
+              const labels = m[1].split(',').map(s => s.trim()).filter(Boolean);
+              if (labels.length) {
+                await github.rest.issues.addLabels({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  issue_number: context.payload.pull_request.number,
+                  labels
+                });
+              }
+            }

@@ -1,0 +1,94 @@
+name: OpenRouter Auth Smoke
+
+on:
+  workflow_dispatch:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check OPEN_ROUTER_API_KEY presence
+        env:
+          OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${OPEN_ROUTER_API_KEY:-}" ]; then
+            echo "⛔ Secret OPEN_ROUTER_API_KEY is NOT available to this workflow."
+            exit 1
+          fi
+          echo "✅ Secret OPEN_ROUTER_API_KEY is present."
+
+      - name: Auth ping (accept 200 or 429; try primary+fallbacks)
+        env:
+          OPEN_ROUTER_API_KEY: ${{ secrets.OPEN_ROUTER_API_KEY }}
+          LLM_MODEL: ${{ vars.LLM_MODEL }}
+          LLM_FALLBACKS: ${{ vars.LLM_FALLBACKS }}
+          REPO_URL: ${{ format('{0}/{1}', github.server_url, github.repository) }}
+        run: |
+          set -euo pipefail
+
+          # Санитизация ключа (убираем CR/LF, края, zero-width)
+          cleaned="$(printf '%s' "${OPEN_ROUTER_API_KEY-}" \
+            | tr -d '\r\n' \
+            | sed -E 's/^[[:space:]"]+//; s/[[:space:]"]+$//' \
+            | perl -CSDA -pe 's/\x{200B}|\x{200C}|\x{200D}|\x{FEFF}//g')"
+
+          LEN="$(printf '%s' "$cleaned" | wc -c)"
+          FP="$(printf '%s' "$cleaned" | sha256sum | cut -c1-8)"
+          echo "API key length after sanitize: $LEN"
+          echo "API key fingerprint: $FP"
+
+          # Список моделей: primary + fallbacks
+          MODELS="${LLM_MODEL:-deepseek/deepseek-chat-v3-0324:free}"
+          if [ -n "${LLM_FALLBACKS:-}" ]; then
+            MODELS="$MODELS,${LLM_FALLBACKS}"
+          else
+            # разумный дефолт фоллбэка
+            MODELS="$MODELS,deepseek/deepseek-r1:free"
+          fi
+
+          IFS=',' read -r -a arr <<< "$MODELS"
+          ok=0
+          for M in "${arr[@]}"; do
+            M="$(echo "$M" | xargs)"
+            [ -n "$M" ] || continue
+            echo "→ Trying model: $M"
+            REQ=$(jq -n --arg m "$M" \
+                   '{model:$m, messages:[{"role":"user","content":"ping"}], max_tokens:16, temperature:0.0}')
+            RESP=$(curl -sS -w "\n%{http_code}" https://openrouter.ai/api/v1/chat/completions \
+              -H "Authorization: Bearer ${cleaned}" \
+              -H "Content-Type: application/json" \
+              -H "HTTP-Referer: ${REPO_URL}" \
+              -H "X-Title: OpenRouter Smoke" \
+              -d "$REQ")
+
+            BODY=$(printf '%s' "$RESP" | head -n -1)
+            CODE=$(printf '%s' "$RESP" | tail -n 1)
+            echo "HTTP: $CODE"
+            echo "$BODY" | jq . 2>/dev/null || echo "$BODY"
+
+            if [ "$CODE" -eq 200 ]; then
+              OUT=$(echo "$BODY" | jq -r '.choices[0].message.content // empty')
+              if [ -n "$OUT" ]; then
+                echo "✅ Auth OK via $M"
+                ok=1; break
+              fi
+            elif [ "$CODE" -eq 429 ]; then
+              echo "🟡 Rate limited via $M — auth OK (treat as success)."
+              ok=1; break
+            elif [ "$CODE" -eq 401 ]; then
+              echo "❌ Unauthorized (401) — ключ неверный/пустой."
+              exit 1
+            elif [ "$CODE" -eq 403 ]; then
+              echo "❌ Forbidden (403). На ключе включены 'Allowed sites'."
+              echo "   Добавь '${REPO_URL}' или 'https://github.com' в OpenRouter → Settings → API Keys → Allowed sites."
+              exit 1
+            else
+              echo "… error with $M, trying next fallback"
+            fi
+          done
+
+          if [ "$ok" -ne 1 ]; then
+            echo "❌ No model succeeded (not 200/429)."
+            exit 1
+          fi
